@@ -7,6 +7,7 @@ const { getState, triggerWaitingSweep } = require('../interlocking');
 const waiting = require('../waiting');
 const cancellation = require('../cancellation');
 const blockade = require('../blockade');
+const handover = require('../handover');
 
 const router = express.Router();
 router.use(requireAuth('admin'));
@@ -403,6 +404,8 @@ router.post('/reset/state', wrap((req, res) => {
     waiting.cancelAllByReset('管理员清空推演状态，全部等待申请撤销');
     // 管理员重置推演：清除全部临时封锁记录
     blockade.clearAllByReset();
+    // 站场重置：未签收交接单标记过期（已签收单保留供复盘）
+    handover.expirePendingByReset('管理员清空推演状态（站场重置），未签收交接单过期；已签收单保留供复盘');
   })();
   res.json({ ok: true, state: getState() });
 }));
@@ -422,6 +425,8 @@ router.post('/reset/training', wrap((req, res) => {
     waiting.cancelAllByReset('管理员恢复示例初始状态（培训重开），全部等待申请撤销');
     // 管理员重置推演：清除全部临时封锁记录
     blockade.clearAllByReset();
+    // 站场重置：未签收交接单标记过期（已签收单保留供复盘）
+    handover.expirePendingByReset('管理员恢复示例初始状态/培训重开（站场重置），未签收交接单过期；已签收单保留供复盘');
   })();
   res.json({ ok: true, state: getState() });
 }));

@@ -225,12 +225,180 @@ function renderSide() {
   if (currentRouteObj()) {
     side.appendChild(renderRouteOps());
   }
+  side.appendChild(renderHandoverPanel());
   side.appendChild(renderBlockadePanel());
   side.appendChild(renderWaitingPanel());
   side.appendChild(renderCancellationPanel());
   side.appendChild(renderSwitchPanel());
   side.appendChild(renderSectionPanel());
   side.appendChild(renderInstances());
+}
+
+/* ------------------------------- 值班交接单 ------------------------------- */
+
+const HANDOVER_STATUS = {
+  pending: ['amber', '待签收'],
+  signed: ['green', '已签收'],
+  expired: ['unknown', '已过期']
+};
+
+function fmtTime(ms) {
+  return ms ? new Date(ms).toLocaleString() : '—';
+}
+
+function renderHandoverPanel() {
+  const box = html('div', {});
+  box.appendChild(html('div', { class: 'section-title' }, '③ 交接班（交接单）'));
+
+  const genRow = html('div', { class: 'row', style: 'margin:4px 0 8px;' });
+  const genBtn = html('button', { class: 'primary small' }, '交班：生成交接单');
+  genBtn.addEventListener('click', generateHandover);
+  genRow.appendChild(genBtn);
+  genRow.appendChild(html('span', { class: 'hint' },
+    '快照当前区段占用、道岔位置、开放进路信号/走行进度、等待申请、待处理延时取消与未结束封锁'));
+  box.appendChild(genRow);
+
+  const list = STATE.handovers || [];
+  if (!list.length) {
+    box.appendChild(html('div', { class: 'hint' }, '暂无交接单。交班值班员点上方按钮即可生成（不影响任何正在进行的操作）。'));
+    return box;
+  }
+  list.slice(0, 8).forEach((h) => box.appendChild(renderHandoverCard(h)));
+  box.appendChild(html('div', { class: 'hint', style: 'margin-top:6px;' },
+    '接班人姓名须与交班人不同；生成后上述任一类状态变化，签收将被拒绝、列出变化类别并标记过期，需交班人重新生成。' +
+    '站场重置会使未签收单过期，已签收单保留供复盘。'));
+  return box;
+}
+
+function renderHandoverCard(h) {
+  const me = App.name();
+  const [cls, txt] = HANDOVER_STATUS[h.status] || ['unknown', h.status];
+  const card = html('div', {
+    class: `instance-card ${h.shiftFrom === me || h.shiftTo === me ? 'mine' : ''}`,
+    id: 'handover-' + h.id
+  });
+
+  const head = html('div', { class: 'row' });
+  head.appendChild(html('b', {}, `交接单 #${h.id}`));
+  head.appendChild(html('span', { class: 'muted' },
+    `交班 ${h.shiftFrom}${h.shiftFrom === me ? '（我）' : ''}`));
+  head.appendChild(html('span', { class: 'muted' }, '→'));
+  head.appendChild(html('span', { class: 'muted' },
+    h.shiftTo ? `接班 ${h.shiftTo}${h.shiftTo === me ? '（我）' : ''}` : '未签收'));
+  head.appendChild(html('span', { class: 'muted', style: 'flex:1;' }));
+  head.appendChild(html('span', { class: `badge ${cls}` }, txt));
+  card.appendChild(head);
+
+  card.appendChild(html('div', { class: 'hint', style: 'margin-top:4px;' },
+    `生成于 ${fmtTime(h.generatedAt)}` + (h.signedAt ? `；签收于 ${fmtTime(h.signedAt)}` : '')));
+
+  // 交接内容摘要（六类状态计数 + 明细折叠）
+  const snap = h.snapshot || {};
+  const summary = html('div', { class: 'hint', style: 'margin-top:4px;' });
+  summary.appendChild(document.createTextNode(
+    `交接内容：区段 ${snap.sections ? snap.sections.length : 0} 个、` +
+    `道岔 ${snap.switches ? snap.switches.length : 0} 个、` +
+    `开放进路 ${snap.openInstances ? snap.openInstances.length : 0} 条、` +
+    `等待申请 ${snap.waiting ? snap.waiting.length : 0} 条、` +
+    `待处理延时取消 ${snap.cancellations ? snap.cancellations.length : 0} 条、` +
+    `未结束封锁 ${snap.blockades ? snap.blockades.length : 0} 项。`));
+  card.appendChild(summary);
+
+  const det = html('details', { style: 'margin-top:4px;' });
+  det.appendChild(html('summary', { class: 'hint', style: 'cursor:pointer;' }, '查看交接时完整盘面'));
+  det.appendChild(renderHandoverSnapshot(snap));
+  card.appendChild(det);
+
+  if (h.expireReason) {
+    card.appendChild(html('div', { class: 'hint', style: 'margin-top:4px;color:var(--red);' },
+      '过期原因：' + h.expireReason));
+  }
+
+  // 操作行
+  if (h.status === 'pending') {
+    const row = html('div', { class: 'row', style: 'margin-top:6px;' });
+    const signBtn = html('button', { class: 'primary small' }, '接班：签收此交接单');
+    signBtn.addEventListener('click', () => signHandover(h.id));
+    row.appendChild(signBtn);
+    if (h.shiftFrom === me) {
+      row.appendChild(html('span', { class: 'hint' }, '交班人本人不能签收自己的交接单'));
+    } else {
+      row.appendChild(html('span', { class: 'hint' }, `以当前值班员 ${me} 名义签收`));
+    }
+    card.appendChild(row);
+  }
+  return card;
+}
+
+/** 渲染交接单快照明细（只读） */
+function renderHandoverSnapshot(snap) {
+  const box = html('div', { style: 'margin-top:4px;' });
+
+  box.appendChild(html('div', { class: 'hint' },
+    '区段占用：' + (snap.sections || []).map((s) =>
+      `${s.id}=${OCC_TEXT[s.occState] || s.occState}`).join('，') || '无'));
+  box.appendChild(html('div', { class: 'hint' },
+    '道岔位置：' + (snap.switches || []).map((s) => `${s.id}=${s.position}`).join('，') || '无'));
+
+  const insts = snap.openInstances || [];
+  if (insts.length) {
+    for (const i of insts) {
+      box.appendChild(html('div', { class: 'hint', style: 'margin-top:4px;' },
+        `开放进路 #${i.id} ${i.routeId}（${i.openedBy}）：信号 ${SIG_TEXT[i.signalState]}，` +
+        `下一序号 ${i.nextSeq}，锁闭区段 [${i.lockedSections.join(',')}]，` +
+        `锁闭道岔 [${i.lockedSwitches.join(',')}]，走行 ` +
+        (i.events.length ? i.events.map((e) =>
+          `#${e.seq}${e.action === 'occupy' ? '占' : '清'}${e.sectionId}`).join(',') : '尚无')));
+    }
+  } else {
+    box.appendChild(html('div', { class: 'hint' }, '开放进路：无'));
+  }
+
+  box.appendChild(html('div', { class: 'hint' },
+    '等待申请：' + ((snap.waiting || []).map((w) =>
+      `#${w.id} ${w.routeId}(${w.applicant})`).join('，') || '无')));
+  box.appendChild(html('div', { class: 'hint' },
+    '待处理延时取消：' + ((snap.cancellations || []).map((c) =>
+      `#${c.id} 实例#${c.instanceId}（${c.applicant}，最早解除 ${new Date(c.releaseAt).toLocaleTimeString()}）`).join('，') || '无')));
+  box.appendChild(html('div', { class: 'hint' },
+    '未结束封锁：' + ((snap.blockades || []).map((b) =>
+      `#${b.id} 区段${b.sectionId}(${b.status === 'active' ? '已生效' : '待生效'}，${b.reason})`).join('，') || '无')));
+  return box;
+}
+
+async function generateHandover() {
+  if (!confirm('确认按当前盘面生成交接单？\n将快照区段占用、道岔位置、开放进路信号与走行进度、等待申请、待处理延时取消与未结束封锁。' +
+    '\n（不会影响任何正在进行的进路与申请；本人此前未签收的交接单将被新单取代）')) return;
+  try {
+    const data = await api('/api/handovers', { method: 'POST' });
+    const n = (data.superseded || []).length;
+    toast(`交接单 #${data.handover.id} 已生成（${n ? `此前 #${data.superseded.join('、#')} 待签收单被取代` : '无待签收单被取代'}），等待接班值班员签收`, 'ok', 6000);
+    await load(true);
+    setTimeout(() => {
+      const node = document.getElementById('handover-' + data.handover.id);
+      if (node) node.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }, 50);
+  } catch (e) { toast(e.message, 'err', 7000); }
+}
+
+async function signHandover(id) {
+  if (!confirm(`签收交接单 #${id}？签收人：${App.name()}。\n` +
+    '系统将在同一时刻原子核对生成后的盘面状态；若任一类状态已变化，签收会被拒绝、列出变化类别，该单标记过期，需交班人重新生成。')) return;
+  try {
+    const data = await api(`/api/handovers/${id}/sign`, { method: 'POST' });
+    toast(data.repeated
+      ? `你已签收过交接单 #${id}，返回原签收结果（幂等）`
+      : `交接单 #${id} 签收成功，接班人 ${data.handover.shiftTo}`, 'ok', 6000);
+    await load(true);
+  } catch (e) {
+    if (e.data && e.data.code === 'HANDOVER_STALE') {
+      const changes = (e.data.changes || []).map((c) => `· ${c.label}：${c.detail}`).join('\n');
+      toast(`交接单 #${id} 已过期，不能签收：\n${changes || e.message}\n请交班人重新生成。`, 'err', 12000);
+    } else {
+      toast(e.message, 'err', 7000);
+    }
+    await load(true);
+  }
 }
 
 /* ------------------------------- 临时封锁 ------------------------------- */

@@ -578,7 +578,9 @@ function getState() {
     cancelProtectionSeconds: require('./cancellation').getProtectionSeconds(),
     // 临时封锁：全部申请（管理员/值班台显示）+ 未结束封锁按区段索引
     blockades: require('./blockade').listBlockades(),
-    blockadesBySection: require('./blockade').unfinishedBySection()
+    blockadesBySection: require('./blockade').unfinishedBySection(),
+    // 值班交接单（最近若干条；值班台交接面板据此生成/查看/签收）
+    handovers: require('./handover').recentHandovers()
   };
 }
 

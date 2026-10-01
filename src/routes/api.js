@@ -6,6 +6,7 @@ const inter = require('../interlocking');
 const waiting = require('../waiting');
 const cancellation = require('../cancellation');
 const blockade = require('../blockade');
+const handover = require('../handover');
 const { InterlockError } = require('../interlocking');
 
 const router = express.Router();
@@ -142,6 +143,55 @@ router.get('/waiting', wrap((req, res) => {
 router.post('/waiting/:id/cancel', wrap((req, res) => {
   const app = waiting.cancelApplication(Number(req.params.id), req.session.name);
   res.json({ ok: true, waiting: app });
+}));
+
+/* ------------------------------ 值班交接单 ------------------------------ */
+
+// 交班：生成交接单（记录当时六类状态快照与生成时间、交班人；
+// 同一交班人此前未签收单标记为被新单取代）。交接单不阻塞任何既有操作。
+router.post('/handovers', wrap((req, res) => {
+  const result = handover.generateHandover(req.session.name);
+  res.status(201).json({
+    ok: true,
+    handover: result.handover,
+    superseded: result.superseded
+  });
+}));
+
+// 查看交接单列表（值班台全员可见）：
+// ?status=pending|signed|expired；?mine=1 仅本人交班或接班相关；?scope=all 显式全员（默认即全员）
+router.get('/handovers', wrap((req, res) => {
+  const status = ['pending', 'signed', 'expired'].includes(req.query.status)
+    ? req.query.status : null;
+  const filter = { status };
+  if (String(req.query.mine || '') === '1') {
+    // 本人相关（交班或接班），在服务层过滤
+    const name = req.session.name;
+    const list = handover.listHandovers({ status })
+      .filter((h) => h.shiftFrom === name || h.shiftTo === name);
+    return res.json({ ok: true, handovers: list, me: name });
+  }
+  res.json({ ok: true, handovers: handover.listHandovers(filter), me: req.session.name });
+}));
+
+// 查看单张交接单（含完整快照，供接班值班员核对/复盘）
+router.get('/handovers/:id', wrap((req, res) => {
+  const h = handover.getHandover(Number(req.params.id));
+  if (!h) throw new InterlockError(404, 'HANDOVER_NOT_FOUND',
+    `交接单 ${req.params.id} 不存在`);
+  res.json({ ok: true, handover: h, me: req.session.name });
+}));
+
+// 接班：签收交接单（签收人即当前登录值班员，姓名须与交班人不同；
+// 同一人重复签收返回原结果，其他人重复签收拒绝；状态变化则拒绝、列变化类别并标记过期。
+// 生成与签收的"快照采集→指纹判定→落库"在同一 SQLite 同步事务内原子完成。
+router.post('/handovers/:id/sign', wrap((req, res) => {
+  const result = handover.signHandover(Number(req.params.id), req.session.name);
+  res.status(result.repeated ? 200 : 201).json({
+    ok: true,
+    handover: result.handover,
+    repeated: result.repeated
+  });
 }));
 
 module.exports = router;

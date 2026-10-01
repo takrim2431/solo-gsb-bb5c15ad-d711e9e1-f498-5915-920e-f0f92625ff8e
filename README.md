@@ -59,6 +59,19 @@
   - 管理员可结束待生效或已生效封锁；结束后按现有联锁规则重试等待兑现，**不改写
     区段占用状态**。管理员与值班员页面均显示封锁状态；管理员重置推演时清除封锁
     记录。
+- **值班交接单（交班生成、接班签收）**
+  - 交班值班员可随时生成交接单，快照当时的**区段占用、道岔实际位置、开放进路的
+    信号与走行进度（事件/序号/锁闭）、等待申请、待处理延时取消申请、未结束封锁**，
+    并记录生成时间与交班人。
+  - 接班值班员在值班台查看完整盘面后签收，签收人姓名**必须与交班人不同**；
+    **同一人重复签收返回原结果（幂等），其他人重复签收拒绝**。
+  - 签收在**同一时刻、同一 SQLite 事务内**重算六类状态指纹并与生成时快照比对：
+    生成后任一状态变化即**拒绝签收、列出变化类别（细到区段/道岔/实例/申请编号）
+    并将该单标记过期**，由交班人重新生成；同步事务串行化保证并发操作不可能让过时
+    交接单签收成功。
+  - 交接单**不阻塞任何既有操作**（开放、走行、扳岔、等待/取消/封锁均照常）；
+    **站场重置只令未签收单过期，已签收单保留供复盘**；全部记录持久化，刷新/重启后
+    仍可查询。
 - **联锁规则**
   - 开放时在单个 SQLite 事务内检查并锁定资源：区段被占用（含**未知状态按占用处理**）、
     道岔实际位置与要求不符、资源已被其他开放进路锁定时一律拒绝，**回滚且不留下
@@ -419,13 +432,115 @@ curl -s -X POST http://localhost:3000/api/admin/blockades/2/end \
 `POST /api/routes/:id/open` 返回 `409 SECTION_BLOCKADED`；走行事件
 `POST /api/instances/:id/events`、延时取消等既有接口约定不变。
 
+## 值班交接单用法（交班生成 · 接班签收）
+
+值班员轮换时，交班人在值班台 **"③ 交接班（交接单）"** 面板点
+**"交班：生成交接单"**（或调用下面的 HTTP API）。交接单记录生成时刻的六类盘面
+状态与交班人；接班人登录值班台即可看到待签收交接单，展开"查看交接时完整盘面"
+核对无误后点 **"接班：签收此交接单"**。
+
+- **快照内容（六类）**：① 全部区段占用状态（未知按占用）；② 全部道岔实际位置；
+  ③ 每条开放进路的信号（红/绿）、走行事件流水与下一序号/可进入步/可出清步、仍
+  锁闭的区段与道岔；④ 全部等待中的等待申请；⑤ 全部待处理延时取消申请（含最早
+  解除时刻）；⑥ 全部未结束（待生效/已生效）封锁。另含 `generatedAt` 生成时间与
+  `shiftFrom` 交班人。
+- **签收规则**：签收人即当前登录值班员，**姓名必须与交班人不同**（本人签收返回
+  `400 HANDOVER_SAME_PERSON`）；同一人对同一单重复签收返回 **200** 与原签收结果
+  （`repeated:true`），其他人重复签收返回 `409 HANDOVER_ALREADY_SIGNED`。
+- **过期判定（原子）**：签收事务在同一时刻重算六类状态的 SHA-256 指纹（规范化
+  JSON，键排序），与生成快照不一致即返回 `409 HANDOVER_STALE`，响应的 `changes`
+  逐项列出**变化类别与明细**，同时该单落库为 `expired`；接班人请交班人重新生成。
+  生成与签收的"采集快照 → 指纹判定 → 写签收/过期"都在单个 better-sqlite3 同步
+  事务内完成，事务间严格串行，**并发的状态变更不可能穿过校验使过时交接单签收
+  成功**。
+- **变化类别**：`sections` 区段占用、`switches` 道岔位置、`openRoutes` 开放进路的
+  信号与走行进度、`waiting` 等待申请、`cancellations` 延时取消申请、
+  `blockades` 未结束封锁。
+- **重新生成**：交班人再次生成时，其本人此前**未签收**的交接单自动标记
+  `expired`（原因"交班人重新生成交接单，本单被新单取代"，响应 `superseded` 列出
+  编号）；已签收单与其他人的待签收单不受影响。
+- **不阻塞 / 重置 / 重启**：交接单不改变任何既有接口行为；管理员"清空推演状态/
+  培训重开"会把全部**未签收**单标记过期（已签收单保留供复盘）；所有记录存 SQLite，
+  页面刷新、服务重启后仍可查询与签收。
+
+### 值班交接单 HTTP API（含调用示例）
+
+需值班员 Bearer 令牌（登录方式同前）。
+
+**1) 交班：生成交接单**
+
+```bash
+curl -s -X POST http://localhost:3000/api/handovers \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+返回 **201**（若本人此前有未签收单，随响应 `superseded` 一并取代）：
+
+```json
+{"ok":true,"superseded":[5],
+ "handover":{"id":6,"shiftFrom":"值班员甲","shiftTo":null,"status":"pending",
+  "generatedAt":1790820000000,"signedAt":null,"expireReason":null,
+  "digest":"9f2c…（64 位 SHA-256）",
+  "snapshot":{
+    "sections":[{"id":"1","occState":"free"}],
+    "switches":[{"id":"SW7","position":"N"}],
+    "openInstances":[{"id":12,"routeId":"R1","openedBy":"值班员甲",
+      "signalState":"green","nextSeq":1,"headStep":1,"tailStep":1,
+      "lockedSections":["1","3","5"],"lockedSwitches":["SW7","SW8"],
+      "events":[]}],
+    "waiting":[],"cancellations":[],"blockades":[]}}}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `status` | `pending` 待签收 / `signed` 已签收 / `expired` 已过期（状态变化、被新单取代、站场重置） |
+| `shiftFrom` / `shiftTo` | 交班人 / 接班人（签收后写入） |
+| `generatedAt` / `signedAt` | 生成时刻 / 签收时刻（epoch 毫秒） |
+| `snapshot` | 生成时刻六类状态的完整快照（查看交接内容、复盘） |
+| `digest` | 六类状态的规范化 SHA-256 指纹；签收时同事务重算比对 |
+| `expireReason` | 过期说明；`superseded`（仅生成响应）被本单取代的旧单编号 |
+
+**2) 接班：签收交接单**（签收人为当前登录值班员；姓名须与交班人不同）
+
+```bash
+curl -s -X POST http://localhost:3000/api/handovers/6/sign \
+  -H "Authorization: Bearer $TOKEN2"
+```
+
+首次签收成功返回 **201**；同一人重复签收返回 **200** 且 `repeated:true`（原结果
+不变）。生成后盘面有变化时返回 **409 `HANDOVER_STALE`**：
+
+```json
+{"ok":false,"error":"交接单 #6 自生成后站场状态已变化，签收被拒绝，本单已标记过期；变化类别：道岔位置；请交班人核对后重新生成",
+ "code":"HANDOVER_STALE",
+ "changes":[{"category":"switches","label":"道岔位置","detail":"道岔 SW8：N → R"}]}
+```
+
+被拒情形：交接单不存在 `404 HANDOVER_NOT_FOUND`；接班人就是交班人
+`400 HANDOVER_SAME_PERSON`；已被他人签收 `409 HANDOVER_ALREADY_SIGNED`
+（附 `signedBy`）；单据已过期 `409 HANDOVER_EXPIRED`；未登录 `401`；管理员
+`403`。
+
+**3) 查看交接单**（列表随 `/api/state` 的 `handovers` 一并下发，面板自动刷新）
+
+```bash
+# 全员最近交接单（待签收在前），可按状态过滤
+curl -s "http://localhost:3000/api/handovers" -H "Authorization: Bearer $TOKEN"
+curl -s "http://localhost:3000/api/handovers?status=pending" -H "Authorization: Bearer $TOKEN"
+# 只看与本人相关（本人交班或接班）
+curl -s "http://localhost:3000/api/handovers?mine=1" -H "Authorization: Bearer $TOKEN"
+# 查看单张完整内容（含快照）
+curl -s "http://localhost:3000/api/handovers/6" -H "Authorization: Bearer $TOKEN"
+```
+
 ## 数据持久化与重置
 
 - 全部拓扑、状态、事件、进路实例、会话、**等待申请、延时取消申请与保护时长设置、
-  临时封锁申请**均在本地 SQLite（默认卷 `interlock-data`）。
+  临时封锁申请、值班交接单**均在本地 SQLite（默认卷 `interlock-data`）。
 - 管理员页面"推演管理"提供：**清空推演状态**（删除进路实例/事件，区段恢复为未知、
   道岔回 N，保留站场图；同时撤销全部未兑现等待申请、**清除全部延时取消申请与临时
-  封锁记录**）；**恢复示例初始状态**（额外把示例区段置为空闲；同样撤销/清除）。
+  封锁记录、令未签收交接单过期（已签收单保留供复盘）**）；**恢复示例初始状态**
+  （额外把示例区段置为空闲；同样撤销/清除/过期）。
   "推演管理"中还可设置延时取消保护时长（正整数秒，仅影响之后新申请）。
 - 存在已开放进路期间，站场图（拓扑/进路定义）不可编辑，防止改变正在使用的线路。
 - 值班员退出登录会撤销本人全部未兑现等待申请；进路定义被修改/删除时，相关未兑现
@@ -454,24 +569,27 @@ curl -s -X POST http://localhost:3000/api/admin/blockades/2/end \
 │   ├── waiting.js             # 等待申请（提交/撤销/顺位/事务内自动兑现）
 │   ├── cancellation.js        # 延时取消（申请/保护期/到期同事务核验/重启续处理）
 │   ├── blockade.js            # 临时封锁（发起/结束/待生效复核/重置清除）
+│   ├── handover.js            # 值班交接单（六类快照/指纹原子签收/过期/重置）
 │   └── routes/
 │       ├── auth.js
-│       ├── admin.js           # 含保护时长设置、临时封锁管理、重置时清除取消/封锁
-│       └── api.js             # 值班员接口（含等待申请、延时取消、封锁只读查看）
-├── public/                    # 前端页面（登录/管理员/值班员，值班台含等待/延时取消/封锁面板）
+│       ├── admin.js           # 含保护时长设置、临时封锁管理、重置时清除取消/封锁/交接单
+│       └── api.js             # 值班员接口（含等待申请、延时取消、封锁只读、交接单）
+├── public/                    # 前端页面（登录/管理员/值班员，值班台含等待/延时取消/封锁/交接单面板）
 └── test/
     ├── smoke.cjs              # 无需鉴权的联锁冒烟/并发测试脚本
     ├── waiting-http.cjs       # 等待申请 HTTP 端到端测试（含重启场景）
     ├── cancellation-http.cjs  # 延时取消 HTTP 端到端测试（含到期/终止/重启/重置）
-    └── blockade-http.cjs      # 临时封锁 HTTP 端到端测试（含阻断/复核/结束/重启/重置）
+    ├── blockade-http.cjs      # 临时封锁 HTTP 端到端测试（含阻断/复核/结束/重启/重置）
+    └── handover-http.cjs      # 交接单 HTTP 端到端测试（签收/过期六类/并发原子/重置/重启）
 ```
 
 ## 测试
 
 ```bash
-npm test             # 联锁冒烟 + 等待申请 + 延时取消 + 临时封锁端到端（共 269 项断言）
+npm test             # 联锁冒烟 + 等待 + 延时取消 + 临时封锁 + 交接单端到端（共 420 项断言）
 npm run smoke        # 联锁核心规则
 npm run test:waiting# 等待申请提交/撤销/顺位/自动兑现/失效/重启
 npm run test:cancel  # 延时取消申请/重复幂等/到期解除/首段占用终止/区段占用终止/重启/重置
 npm run test:blockade# 临时封锁发起/校验/阻断/状态复核/结束/重启/重置
+npm run test:handover# 交接单生成/签收/重复幂等/六类变化过期/并发原子仲裁/重置保留/重启
 ```
