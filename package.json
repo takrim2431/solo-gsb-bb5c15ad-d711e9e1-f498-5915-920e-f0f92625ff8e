@@ -11,7 +11,8 @@
     "test:waiting": "node test/waiting-http.cjs",
     "test:cancel": "node test/cancellation-http.cjs",
     "test:blockade": "node test/blockade-http.cjs",
-    "test": "npm run smoke && npm run test:waiting && npm run test:cancel && npm run test:blockade"
+    "test:handover": "node test/handover-http.cjs",
+    "test": "npm run smoke && npm run test:waiting && npm run test:cancel && npm run test:blockade && npm run test:handover"
   },
   "engines": {
     "node": ">=18"

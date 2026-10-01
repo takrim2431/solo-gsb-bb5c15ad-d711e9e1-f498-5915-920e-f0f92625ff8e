@@ -209,6 +209,32 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_blockade_unfinished_section
   ON blockade_applications(section_id) WHERE status IN ('pending','active');
 CREATE INDEX IF NOT EXISTS idx_blockade_status ON blockade_applications(status, id);
 
+-- 交接班交接单：
+--  - 交班值班员生成时，在同一事务内快照六类状态：区段占用、道岔位置、
+--    开放进路（信号与走行进度）、等待申请、延时取消申请、未结束封锁，
+--    并记录生成时刻（epoch 毫秒）与交班人；
+--  - 接班值班员签收时在同一事务内按同一时刻的状态重新取快照比对：
+--    任一类别已变化即拒绝签收、列出变化类别并把该单标记为 expired，
+--    由交班人重新生成；签收成功后他人不可再签收；
+--  - 同一接班人重复签收幂等返回原结果；交班人本人签收直接拒绝；
+--  - 同一交班人生成新单时，其此前未签收的单标记过期（被新单替换）；
+--  - 站场重置使全部未签收（active）单过期，已签收（signed）单保留供复盘；
+--    交接单只读快照、不写业务资源，不阻塞任何既有操作。
+CREATE TABLE IF NOT EXISTS handover_documents (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  from_name     TEXT NOT NULL,             -- 交班人（生成者）
+  to_name       TEXT,                      -- 接班人（签收时写入）
+  -- active 待签收 / signed 已签收 / expired 已过期（状态变化/被新单替换/站场重置）
+  status        TEXT NOT NULL DEFAULT 'active'
+                 CHECK (status IN ('active','signed','expired')),
+  generated_at  INTEGER NOT NULL,          -- 生成时刻（epoch 毫秒）
+  signed_at     INTEGER,                   -- 签收时刻（epoch 毫秒）
+  snapshot      TEXT NOT NULL,             -- 六类状态快照（JSON）
+  expire_reason TEXT,                      -- 过期说明（JSON：类别/明细/原因）
+  created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_handover_status ON handover_documents(status, id);
+
 CREATE INDEX IF NOT EXISTS idx_locks_instance ON route_locks(instance_id);
 CREATE INDEX IF NOT EXISTS idx_events_instance ON section_events(instance_id, seq);
 CREATE INDEX IF NOT EXISTS idx_steps_route ON route_steps(route_id, step_order);

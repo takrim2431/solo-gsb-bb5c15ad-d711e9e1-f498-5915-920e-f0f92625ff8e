@@ -6,6 +6,7 @@ const inter = require('../interlocking');
 const waiting = require('../waiting');
 const cancellation = require('../cancellation');
 const blockade = require('../blockade');
+const handover = require('../handover');
 const { InterlockError } = require('../interlocking');
 
 const router = express.Router();
@@ -142,6 +143,61 @@ router.get('/waiting', wrap((req, res) => {
 router.post('/waiting/:id/cancel', wrap((req, res) => {
   const app = waiting.cancelApplication(Number(req.params.id), req.session.name);
   res.json({ ok: true, waiting: app });
+}));
+
+/* ------------------------------ 交接班交接单 ------------------------------ */
+
+// 交班人生成交接单（原子快照六类状态；本人此前未签收单被新单替换过期）
+router.post('/handovers', wrap((req, res) => {
+  const doc = handover.generateHandover(req.session.name);
+  res.status(201).json({ ok: true, handover: doc });
+}));
+
+// 查看交接单列表：默认全员；?scope=mine 只看与本人相关（交班或接班）；
+// 可选 ?status=active|signed|expired
+router.get('/handovers', wrap((req, res) => {
+  const scope = String(req.query.scope || 'all');
+  const status = ['active', 'signed', 'expired'].includes(req.query.status)
+    ? req.query.status : null;
+  if (scope === 'mine') {
+    // 与本人相关：本人交班 或 本人接班，合并后按统一顺序不便在 SQL 内过滤，
+    // 数据量小，取本人交班 + 本人接班两个集合
+    const sent = handover.listHandovers({ fromName: req.session.name, status });
+    const received = handover.listHandovers({ toName: req.session.name, status });
+    const merged = [...sent, ...received];
+    const seen = new Set();
+    const list = merged
+      .filter((h) => !seen.has(h.id) && seen.add(h.id))
+      .sort((a, b) => {
+        const rank = { active: 0, signed: 1, expired: 2 };
+        return rank[a.status] - rank[b.status] || b.id - a.id;
+      });
+    return res.json({ ok: true, handovers: list, me: req.session.name });
+  }
+  res.json({
+    ok: true,
+    handovers: handover.listHandovers({ status }),
+    me: req.session.name
+  });
+}));
+
+// 查看单张交接单（含完整快照与过期变化明细）
+router.get('/handovers/:id', wrap((req, res) => {
+  const doc = handover.getHandover(Number(req.params.id));
+  if (!doc) throw new InterlockError(404, 'HANDOVER_NOT_FOUND',
+    `交接单 ${req.params.id} 不存在`);
+  res.json({ ok: true, handover: doc, me: req.session.name });
+}));
+
+// 接班人签收：姓名与交班人不同；状态变化即拒绝并把该单标记过期；
+// 同一人重复签收幂等返回原结果，其他人重复签收拒绝
+router.post('/handovers/:id/sign', wrap((req, res) => {
+  const result = handover.signHandover(Number(req.params.id), req.session.name);
+  res.status(result.repeated ? 200 : 201).json({
+    ok: true,
+    repeated: result.repeated,
+    handover: result.handover
+  });
 }));
 
 module.exports = router;

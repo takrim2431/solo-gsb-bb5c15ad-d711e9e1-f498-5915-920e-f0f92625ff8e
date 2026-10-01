@@ -228,6 +228,7 @@ function renderSide() {
   side.appendChild(renderBlockadePanel());
   side.appendChild(renderWaitingPanel());
   side.appendChild(renderCancellationPanel());
+  side.appendChild(renderHandoverPanel());
   side.appendChild(renderSwitchPanel());
   side.appendChild(renderSectionPanel());
   side.appendChild(renderInstances());
@@ -584,6 +585,218 @@ function renderCancellationCard(c) {
     }, (c.status === 'released' ? '解除说明：' : '终止原因：') + c.endReason));
   }
   return card;
+}
+
+/* ------------------------------- 交接班交接单 ------------------------------- */
+
+const HANDOVER_STATUS = {
+  active: ['amber', '待签收'],
+  signed: ['green', '已签收'],
+  expired: ['unknown', '已过期']
+};
+const HANDOVER_CATEGORY_TEXT = {
+  sections: '区段占用',
+  switches: '道岔位置',
+  openInstances: '开放进路的信号与走行进度',
+  waiting: '等待申请',
+  cancellations: '延时取消申请',
+  blockades: '未结束封锁'
+};
+
+function renderHandoverPanel() {
+  const box = html('div', {});
+  box.appendChild(html('div', { class: 'section-title' }, '交接班交接单'));
+  const me = App.name();
+  const genRow = html('div', { class: 'row' });
+  const genBtn = html('button', { class: 'primary',
+    title: '对当前区段占用、道岔位置、开放进路信号与走行进度、等待/延时取消申请、未结束封锁做同一时刻快照' },
+    '生成交接单（交班）');
+  genBtn.addEventListener('click', generateHandover);
+  genRow.appendChild(genBtn);
+  genRow.appendChild(html('span', { class: 'hint' }, '交接单不影响现有操作；状态在签收前发生变化会被判过期'));
+  box.appendChild(genRow);
+
+  const docs = STATE.handovers || [];
+  if (!docs.length) {
+    box.appendChild(html('div', { class: 'hint', style: 'margin-top:6px;' },
+      '暂无交接单。交班时点"生成交接单"，接班人在下方查看并签收。'));
+    return box;
+  }
+  docs.slice(0, 12).forEach((h) => box.appendChild(renderHandoverCard(h, me)));
+  if (docs.length > 12) {
+    box.appendChild(html('div', { class: 'hint', style: 'margin-top:4px;' },
+      `仅显示最近 12 张（共 ${docs.length} 张）`));
+  }
+  return box;
+}
+
+function renderHandoverCard(h, me) {
+  const [cls, txt] = HANDOVER_STATUS[h.status] || ['unknown', h.status];
+  const card = html('div', {
+    class: `instance-card ${h.fromName === me || h.toName === me ? 'mine' : ''}`,
+    id: 'handover-' + h.id
+  });
+
+  const head = html('div', { class: 'row' });
+  head.appendChild(html('b', {}, `交接单#${h.id}`));
+  head.appendChild(html('span', { class: 'badge ' + cls }, txt));
+  head.appendChild(html('span', { class: 'muted', style: 'flex:1;' }));
+  card.appendChild(head);
+
+  const who = html('div', { class: 'hint', style: 'margin-top:4px;' });
+  who.appendChild(document.createTextNode(
+    `交班人：${h.fromName}${h.fromName === me ? '（我）' : ''}　` +
+    `生成时间：${h.generatedAtText}`));
+  if (h.toName) {
+    who.appendChild(document.createTextNode(
+      `　接班人：${h.toName}${h.toName === me ? '（我）' : ''}　签收时间：${h.signedAtText || ''}`));
+  }
+  card.appendChild(who);
+
+  // 快照摘要
+  card.appendChild(renderHandoverSnapshot(h.snapshot));
+
+  // 过期原因与变化明细
+  if (h.status === 'expired') {
+    if (h.changedCategories && h.changedCategories.length) {
+      const tags = html('div', { class: 'row', style: 'margin-top:6px;' });
+      tags.appendChild(html('span', { class: 'hint' }, '变化类别：'));
+      h.changedCategories.forEach((c) =>
+        tags.appendChild(html('span', { class: 'badge red' }, HANDOVER_CATEGORY_TEXT[c] || c)));
+      card.appendChild(tags);
+      const ul = html('ul', { class: 'reasons', style: 'margin-top:4px;' });
+      h.changes.forEach((g) => (g.details || []).forEach((d) =>
+        ul.appendChild(html('li', {}, d))));
+      card.appendChild(ul);
+    }
+    if (h.expireReason) {
+      card.appendChild(html('div', { class: 'hint', style: 'margin-top:4px;color:var(--red);' },
+        h.expireReason));
+    }
+  }
+
+  // 签收按钮：仅待签收单可签；交班人本人按钮直接禁用（服务端也会拒绝）
+  if (h.status === 'active') {
+    const row = html('div', { class: 'row', style: 'margin-top:6px;' });
+    const btn = html('button', { class: 'primary small' }, '签收（接班）');
+    if (h.fromName === me) {
+      btn.disabled = true;
+      btn.textContent = '接班人须与交班人不同';
+      btn.title = '接班值班员姓名必须与交班人不同';
+    } else {
+      btn.addEventListener('click', () => signHandover(h.id));
+    }
+    row.appendChild(btn);
+    row.appendChild(html('span', { class: 'hint' },
+      '签收按同一时刻状态原子判定；状态变化即拒绝并标记过期'));
+    card.appendChild(row);
+  }
+  return card;
+}
+
+function renderHandoverSnapshot(snap) {
+  const box = html('details', { style: 'margin-top:6px;' });
+  if (!snap) {
+    box.appendChild(html('summary', { class: 'hint', style: 'cursor:pointer;' }, '交接快照（缺失）'));
+    return box;
+  }
+  const sectionEntries = Object.entries(snap.sections || {});
+  const occN = sectionEntries.filter(([, v]) => v === 'occupied').length;
+  const unkN = sectionEntries.filter(([, v]) => v === 'unknown').length;
+  const summary = html('summary', { class: 'hint', style: 'cursor:pointer;' },
+    `交接快照：开放进路 ${Object.keys(snap.openInstances || {}).length} 条 · ` +
+    `占用区段 ${occN} · 未知区段 ${unkN} · 等待申请 ${Object.keys(snap.waiting || {}).length} · ` +
+    `延时取消 ${Object.keys(snap.cancellations || {}).length} · 未结束封锁 ${Object.keys(snap.blockades || {}).length}` +
+    '（点击展开）');
+  box.appendChild(summary);
+
+  // 区段占用
+  const secLine = html('div', { class: 'hint', style: 'margin-top:4px;' }, '区段占用：');
+  sectionEntries.forEach(([id, st]) =>
+    secLine.appendChild(html('span', { class: `badge ${st === 'free' ? 'green' : st === 'occupied' ? 'red' : 'unknown'}`,
+      style: 'margin-left:4px;' }, `${id}:${OCC_TEXT[st] || st}`)));
+  box.appendChild(secLine);
+
+  // 道岔位置
+  const swLine = html('div', { class: 'hint', style: 'margin-top:4px;' }, '道岔位置：');
+  Object.entries(snap.switches || {}).forEach(([id, p]) =>
+    swLine.appendChild(html('span', { class: 'badge lock', style: 'margin-left:4px;' }, `${id}=${p}`)));
+  box.appendChild(swLine);
+
+  // 开放进路
+  const insts = Object.values(snap.openInstances || {});
+  if (!insts.length) {
+    box.appendChild(html('div', { class: 'hint', style: 'margin-top:4px;' }, '开放进路：无'));
+  } else {
+    for (const inst of insts) {
+      const line = html('div', { class: 'hint', style: 'margin-top:4px;' });
+      line.appendChild(document.createTextNode(
+        `进路 #${inst.id} ${inst.routeId}：${inst.signalState === 'green' ? '信号绿' : '信号红'}，` +
+        `已收到事件 ${inst.events.length} 个（下一序号 ${inst.nextSeq}），` +
+        `锁闭区段 ${inst.lockedSections.join('、') || '无'}，锁闭道岔 ${inst.lockedSwitches.join('、') || '无'}。`));
+      box.appendChild(line);
+    }
+  }
+
+  // 等待申请（全部状态：等待中/已兑现/已撤销/已失效）
+  const waits = Object.entries(snap.waiting || {});
+  if (waits.length) {
+    const wLine = html('div', { class: 'hint', style: 'margin-top:4px;' }, '等待申请：');
+    waits.forEach(([id, w]) => wLine.appendChild(document.createTextNode(
+      ` #${id}(${w.routeId},${w.applicant},${w.status})`)));
+    box.appendChild(wLine);
+  }
+
+  // 延时取消
+  const cancels = Object.entries(snap.cancellations || {});
+  if (cancels.length) {
+    const cLine = html('div', { class: 'hint', style: 'margin-top:4px;' }, '延时取消申请：');
+    cancels.forEach(([id, c]) => cLine.appendChild(document.createTextNode(
+      ` #${id}(实例#${c.instanceId},${c.applicant},${c.status})`)));
+    box.appendChild(cLine);
+  }
+
+  // 封锁
+  const blks = Object.entries(snap.blockades || {});
+  if (blks.length) {
+    const bLine = html('div', { class: 'hint', style: 'margin-top:4px;' }, '未结束封锁：');
+    blks.forEach(([id, b]) => bLine.appendChild(document.createTextNode(
+      ` #${id}(区段${b.sectionId},${b.status === 'active' ? '已生效' : '待生效'},原因:${b.reason})`)));
+    box.appendChild(bLine);
+  }
+  return box;
+}
+
+async function generateHandover() {
+  try {
+    const data = await api('/api/handovers', { method: 'POST' });
+    toast(`交接单 #${data.handover.id} 已生成（${data.handover.generatedAtText}），等待接班人签收`, 'ok', 5200);
+    await load(true);
+    setTimeout(() => {
+      const node = document.getElementById('handover-' + data.handover.id);
+      if (node) node.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }, 50);
+  } catch (e) { toast(e.message, 'err', 6500); }
+}
+
+async function signHandover(id) {
+  if (!confirm(`签收交接单 #${id}？签收按当前同一时刻状态原子判定：` +
+    '若生成后区段占用、道岔位置、开放进路信号/走行进度、等待/延时取消申请或封锁有任一变化，签收将被拒绝并标记过期。')) return;
+  try {
+    const data = await api(`/api/handovers/${id}/sign`, { method: 'POST' });
+    if (data.repeated) toast(`你已签收过交接单 #${id}，这是原签收结果（幂等）`, 'info', 5200);
+    else toast(`交接单 #${id} 签收成功，接班完成`, 'ok', 5200);
+    await load(true);
+  } catch (e) {
+    const d = e.data || {};
+    if (d.code === 'HANDOVER_STALE' && Array.isArray(d.changedCategories)) {
+      toast('签收拒绝：' + (d.changedCategories.map((c) => HANDOVER_CATEGORY_TEXT[c] || c).join('、')) +
+        ' 已变化，交接单已标记过期，请交班人重新生成', 'err', 8000);
+    } else {
+      toast(e.message, 'err', 7000);
+    }
+    await load(true);
+  }
 }
 
 /* ------------------------------- 道岔操作 ------------------------------- */
